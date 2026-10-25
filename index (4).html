@@ -1,0 +1,189 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ESP32 Nav</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<style>
+  html,body{margin:0;height:100%;font-family:sans-serif}
+  #top{position:absolute;top:0;left:0;right:0;height:52px;background:#111;display:flex;gap:6px;align-items:center;padding:0 8px;box-sizing:border-box;z-index:1000}
+  #q{flex:1;font-size:16px;padding:8px;border:0;border-radius:6px;min-width:0}
+  button{font-size:15px;padding:8px 12px;border:0;border-radius:6px;color:#fff;background:#1e88e5}
+  #stop{background:#e53935}
+  #map{position:absolute;top:52px;bottom:78px;left:0;right:0}
+  #bar{position:absolute;bottom:0;left:0;right:0;height:78px;background:#111;color:#fff;padding:6px 10px;box-sizing:border-box;font-size:14px;display:flex;align-items:center;justify-content:space-between;gap:8px}
+  #st{flex:1;line-height:1.35}
+  #ble.on{background:#2e7d32}
+</style>
+</head>
+<body>
+<div id="top">
+  <input id="q" placeholder="Search place (or tap on map)">
+  <button onclick="searchPlace()">Go</button>
+</div>
+<div id="map"></div>
+<div id="bar">
+  <div id="st">Waiting for GPS...</div>
+  <div style="display:flex;flex-direction:column;gap:6px">
+    <button id="ble" onclick="connectBle()">Connect ESP32</button>
+    <button id="stop" onclick="stopNav()">Stop</button>
+  </div>
+</div>
+
+<script>
+const SERVICE = '4fafc201-1fb5-459e-8fcc-c5c9c331914b';
+const CHAR    = 'beb5483e-36e1-4688-b7f5-ea07361b26a8';
+
+const st = document.getElementById('st');
+const bleBtn = document.getElementById('ble');
+const map = L.map('map').setView([11.0, 78.0], 15);
+L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png',
+  {maxZoom: 19, attribution: '&copy; OpenStreetMap'}).addTo(map);
+
+let pos = null, me = null, destMk = null, routeLine = null;
+let steps = [], idx = 0, first = true, lastMsg = '';
+let dev = null, chr = null, bleOk = false, busy = false, wakeLock = null;
+
+function setStatus(t){ st.textContent = t; }
+
+/* ---------- helpers ---------- */
+function hav(a,b,c,d){
+  const R=6371000,t=Math.PI/180,dl=(c-a)*t,dn=(d-b)*t;
+  const x=Math.sin(dl/2)**2+Math.cos(a*t)*Math.cos(c*t)*Math.sin(dn/2)**2;
+  return 2*R*Math.atan2(Math.sqrt(x),Math.sqrt(1-x));
+}
+function turnAngle(m){
+  const t={'straight':0,'slight right':45,'right':90,'sharp right':135,'uturn':180,
+           'sharp left':-135,'left':-90,'slight left':-45};
+  return t[m.modifier]!==undefined ? t[m.modifier] : 0;
+}
+async function keepAwake(){
+  try{ if('wakeLock' in navigator) wakeLock = await navigator.wakeLock.request('screen'); }catch(e){}
+}
+document.addEventListener('visibilitychange',()=>{ if(document.visibilityState==='visible') keepAwake(); });
+
+/* ---------- Bluetooth ---------- */
+async function connectBle(){
+  if(!navigator.bluetooth){ setStatus('Web Bluetooth not supported. Use Chrome on Android.'); return; }
+  try{
+    dev = await navigator.bluetooth.requestDevice({filters:[{services:[SERVICE]}]});
+    dev.addEventListener('gattserverdisconnected', onDisc);
+    await openGatt();
+  }catch(e){ setStatus('BLE: '+e.message); }
+}
+async function openGatt(){
+  const s = await dev.gatt.connect();
+  const svc = await s.getPrimaryService(SERVICE);
+  chr = await svc.getCharacteristic(CHAR);
+  bleOk = true;
+  bleBtn.textContent = 'ESP32 OK';
+  bleBtn.className = 'on';
+  keepAwake();
+  sendNav(true);
+}
+function onDisc(){
+  bleOk = false; chr = null;
+  bleBtn.textContent = 'Reconnecting...';
+  bleBtn.className = '';
+  setTimeout(tryReconnect, 3000);
+}
+async function tryReconnect(){
+  if(bleOk || !dev) return;
+  try{ await openGatt(); }catch(e){ setTimeout(tryReconnect, 3000); }
+}
+async function bleSend(str){
+  if(!chr || busy) return;
+  busy = true;
+  try{
+    const data = new TextEncoder().encode(str + '\n');
+    for(let i=0;i<data.length;i+=20){ await chr.writeValue(data.slice(i,i+20)); }
+  }catch(e){}
+  busy = false;
+}
+
+/* ---------- navigation ---------- */
+function sendNav(force){
+  if(!pos) return;
+  let ang=0, d=0, rem=0, arr=0, act=0, road='';
+  let msg = 'GPS ' + pos.spd.toFixed(0) + ' km/h';
+  if(steps.length > 0){
+    act = 1;
+    while(idx < steps.length-1 &&
+          hav(pos.lat,pos.lon,steps[idx+1].maneuver.location[1],steps[idx+1].maneuver.location[0]) < 25) idx++;
+    if(idx >= steps.length-1){
+      const l = steps[steps.length-1].maneuver.location;
+      d = hav(pos.lat,pos.lon,l[1],l[0]); arr = 1;
+    }else{
+      const m = steps[idx+1].maneuver, l = m.location;
+      d = hav(pos.lat,pos.lon,l[1],l[0]); ang = turnAngle(m);
+      if(m.type === 'arrive') arr = 1;
+      road = steps[idx+1].name || '';
+    }
+    rem = d;
+    for(let j=idx+1;j<steps.length;j++) rem += steps[j].distance;
+    msg += ' | turn in ' + d.toFixed(0) + ' m | ' + (rem/1000).toFixed(1) + ' km left';
+  }
+  road = road.replace(/[^\x20-\x7e,]/g,'').replace(/,/g,' ').slice(0,20);
+  const line = [ang, Math.round(d), Math.round(rem), Math.round(pos.spd), arr, act, road].join(',');
+  setStatus(msg + (bleOk ? '' : ' | ESP32 not connected'));
+  bleSend(line);
+}
+
+async function setDest(lat, lon){
+  if(!pos){ setStatus('No GPS yet'); return; }
+  if(destMk) map.removeLayer(destMk);
+  destMk = L.marker([lat, lon]).addTo(map);
+  setStatus('Finding route...');
+  const u = 'https://router.project-osrm.org/route/v1/driving/' + pos.lon + ',' + pos.lat + ';' + lon + ',' + lat +
+            '?steps=true&overview=full&geometries=geojson';
+  try{
+    const j = await (await fetch(u)).json();
+    if(!j.routes || !j.routes.length){ setStatus('No route found'); return; }
+    const r = j.routes[0];
+    if(routeLine) map.removeLayer(routeLine);
+    routeLine = L.geoJSON(r.geometry, {style:{color:'#1e88e5', weight:6}}).addTo(map);
+    map.fitBounds(routeLine.getBounds());
+    steps = r.legs[0].steps; idx = 0;
+    sendNav(true);
+  }catch(e){ setStatus('Route error: need mobile data'); }
+}
+map.on('click', e => setDest(e.latlng.lat, e.latlng.lng));
+
+async function searchPlace(){
+  const q = document.getElementById('q').value.trim();
+  if(!q) return;
+  setStatus('Searching...');
+  try{
+    const j = await (await fetch('https://nominatim.openstreetmap.org/search?format=json&limit=1&q=' + encodeURIComponent(q))).json();
+    if(!j.length){ setStatus('Place not found'); return; }
+    setDest(parseFloat(j[0].lat), parseFloat(j[0].lon));
+  }catch(e){ setStatus('Search error'); }
+}
+
+function stopNav(){
+  steps = []; idx = 0;
+  if(routeLine){ map.removeLayer(routeLine); routeLine = null; }
+  if(destMk){ map.removeLayer(destMk); destMk = null; }
+  sendNav(true);
+}
+
+/* ---------- GPS ---------- */
+if(!navigator.geolocation){
+  setStatus('GPS not available in this browser');
+}else{
+  navigator.geolocation.watchPosition(p => {
+    const c = p.coords;
+    pos = {lat:c.latitude, lon:c.longitude, spd: c.speed==null ? 0 : c.speed*3.6};
+    if(!me) me = L.circleMarker([pos.lat,pos.lon],{radius:8,color:'#fff',fillColor:'#1e88e5',fillOpacity:1}).addTo(map);
+    me.setLatLng([pos.lat,pos.lon]);
+    if(first){ map.setView([pos.lat,pos.lon], 17); first = false; }
+    sendNav(false);
+  }, e => setStatus('GPS error: ' + e.message),
+  {enableHighAccuracy:true, maximumAge:0, timeout:15000});
+}
+keepAwake();
+</script>
+</body>
+</html>
